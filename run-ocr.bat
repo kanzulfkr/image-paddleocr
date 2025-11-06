@@ -5,16 +5,9 @@ echo ====================================
 echo    ACTIVATING VIRTUAL ENVIRONMENT
 echo ====================================
 
-REM Coba berbagai nama venv
-if exist "venv\Scripts\activate.bat" (
-    call venv\Scripts\activate.bat
-    echo ✓ Activated: venv
-) else if exist ".venv\Scripts\activate.bat" (
+if exist ".venv\Scripts\activate.bat" (
     call .venv\Scripts\activate.bat
     echo ✓ Activated: .venv
-) else if exist "env\Scripts\activate.bat" (
-    call env\Scripts\activate.bat
-    echo ✓ Activated: env
 ) else (
     echo ❌ Virtual Environment not found!
     echo.
@@ -41,8 +34,8 @@ echo ====================================
 echo    STARTING OCR PROCESS
 echo ====================================
 
-@REM python main.py --input ./input --output ./output --mode ocr
-python main_structured_and_raw.py --input ./input --output ./output --mode ocr
+python main.py --input ./input --output ./output --mode ocr
+@REM python main_structured_and_raw.py --input ./input --output ./output --mode ocr
 
 echo ====================================
 echo    OCR PROCESS COMPLETED

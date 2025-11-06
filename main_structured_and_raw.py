@@ -615,7 +615,6 @@ def run_table(images, output_dir: Path, processed_dir: Path, lang: str = "en",
             table_max_len=table_max_len
         )
 
-    # Folder output dengan timestamp
     timestamp = get_timestamp()
     base_folder = output_dir / f"table_results_{timestamp}"
     base_folder.mkdir(parents=True, exist_ok=True)
@@ -628,7 +627,6 @@ def run_table(images, output_dir: Path, processed_dir: Path, lang: str = "en",
             result = table_engine(img, return_ocr_result_in_table=True)
             save_structure_res(result, str(base_folder), os.path.splitext(img_path.name)[0])
             
-            # ✅ PINDAHKAN FILE YANG SUDAH DIPROSES (OPSIONAL UNTUK MODE TABLE)
             processed_path = processed_dir / img_path.name
             img_path.rename(processed_path)
             print(f"  → File dipindahkan ke: {processed_path}")
@@ -661,11 +659,9 @@ def main():
     in_dir = Path(args.input)
     out_dir = Path(args.output)
     
-    # Tentukan folder processed
     if args.processed:
         processed_dir = Path(args.processed)
     else:
-        # Default: folder processed sejajar dengan input/output
         processed_dir = in_dir.parent / "processed"
     
     processed_dir.mkdir(parents=True, exist_ok=True)
@@ -683,10 +679,7 @@ def main():
                 use_gpu=args.use_gpu,
                 enable_reconstruction=not args.no_reconstruction)
     else:
-        run_table(images, out_dir, processed_dir,  # ✅ TAMBAH processed_dir
-                 lang=args.lang, 
-                 image_orientation=(not args.no_image_orientation))
-
+        run_table(images, out_dir, processed_dir,lang=args.lang,image_orientation=(not args.no_image_orientation))
 
 if __name__ == "__main__":
     main()
