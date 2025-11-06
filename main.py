@@ -1,65 +1,86 @@
+import argparse
+import os
+import sys
+from pathlib import Path
+from datetime import datetime
+
+import cv2
 import pandas as pd
 import numpy as np
-from paddleocr import PaddleOCR
-import os
+from paddleocr import PaddleOCR, PPStructure, save_structure_res
 
+
+# ----------------------------- KONSTANTA -----------------------------
+SUPPORTED_EXTS = {".png", ".jpg", ".jpeg"}
+
+# ----------------------------- UTILITAS -----------------------------
+def get_timestamp():
+    """Dapatkan timestamp untuk nama file"""
+    return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+def list_images(input_dir: Path):
+    """Kumpulkan semua gambar yang didukung dari folder input."""
+    files = [p for p in sorted(input_dir.iterdir()) if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+    return files
+
+def _read_and_upscale(img_path: Path, max_side: int = 1600):
+    """Baca gambar dan perbesar sisi terpanjang hingga max_side (jika perlu)."""
+    img = cv2.imread(str(img_path))
+    if img is None:
+        raise FileNotFoundError(f"Gagal membaca gambar: {img_path}")
+    h, w = img.shape[:2]
+    scale = max_side / max(h, w)
+    if scale > 1.0:
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
+    return img
+
+# ----------------------------- STRUCTURED RECONSTRUCTION -----------------------------
 class TableReconstructor:
-    def __init__(self):
-        self.ocr = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False)
+    """Kelas untuk merekonstruksi tabel dari hasil OCR"""
     
-    def detect_table_structure(self, image_path):
-        """
-        Extract and reconstruct table structure from image
-        """
-        # OCR processing
-        result = self.ocr.ocr(image_path, cls=True)
-        
-        if not result or not result[0]:
-            return None
-        
-        # Extract data with coordinates
-        ocr_data = []
-        for line in result[0]:
-            if line and len(line) >= 2:
-                text = line[1][0]
-                confidence = line[1][1]
-                bbox = line[0]
-                
-                # Calculate center point
-                x_center = np.mean([point[0] for point in bbox])
-                y_center = np.mean([point[1] for point in bbox])
-                
-                ocr_data.append({
-                    'text': text,
-                    'confidence': confidence,
-                    'bbox': bbox,
-                    'x_center': x_center,
-                    'y_center': y_center,
-                    'x_min': min(point[0] for point in bbox),
-                    'y_min': min(point[1] for point in bbox)
-                })
-        
-        return self.reconstruct_table(ocr_data)
+    @staticmethod
+    def clean_ocr_text(text):
+        """Bersihkan teks hasil OCR dari karakter yang tidak diinginkan"""
+        import re
+        # Hapus karakter tunggal yang tidak perlu
+        text = re.sub(r'\s[v!|]\s', ' ', text)
+        # Hapus karakter khusus di awal/akhir
+        text = re.sub(r'^[!|v]\s*|\s*[!|v]$', '', text)
+        return text.strip()
     
-    def reconstruct_table(self, ocr_data):
+    @staticmethod
+    def reconstruct_table_from_ocr(ocr_data, y_threshold=25):
         """
-        Reconstruct table from OCR data using coordinates
-        """
-        # Sort by Y position (rows) then X position (columns)
-        sorted_data = sorted(ocr_data, key=lambda x: (x['y_center'], x['x_center']))
+        Rekonstruksi tabel dari data OCR menggunakan koordinat bounding box
         
-        # Group into rows (using Y-position clustering)
-        rows = self.group_into_rows(sorted_data)
-        
-        # Align columns and create structured table
-        table = self.align_columns(rows)
-        
-        return table
-    
-    def group_into_rows(self, sorted_data, y_threshold=20):
+        Args:
+            ocr_data: List hasil OCR dengan bounding box
+            y_threshold: Threshold untuk mengelompokkan baris (pixel)
         """
-        Group data points into rows based on Y-coordinates
-        """
+        if not ocr_data:
+            return []
+        
+        # Extract dan sort data berdasarkan posisi Y lalu X
+        structured_data = []
+        for item in ocr_data:
+            bbox = item['bbox']
+            x_center = np.mean([point[0] for point in bbox])
+            y_center = np.mean([point[1] for point in bbox])
+            
+            structured_data.append({
+                'text': item['text'],
+                'cleaned_text': TableReconstructor.clean_ocr_text(item['text']),
+                'confidence': item['confidence'],
+                'x_center': x_center,
+                'y_center': y_center,
+                'x_min': min(point[0] for point in bbox),
+                'y_min': min(point[1] for point in bbox)
+            })
+        
+        # Sort by Y position (baris) lalu X position (kolom)
+        sorted_data = sorted(structured_data, key=lambda x: (x['y_center'], x['x_center']))
+        
+        # Kelompokkan menjadi baris
         rows = []
         current_row = []
         current_y = None
@@ -69,12 +90,13 @@ class TableReconstructor:
                 current_y = data['y_center']
                 current_row.append(data)
             else:
-                # If Y position is close, same row
+                # Jika posisi Y masih dalam threshold yang sama, anggap baris yang sama
                 if abs(data['y_center'] - current_y) <= y_threshold:
                     current_row.append(data)
                 else:
-                    # New row
+                    # Baris baru
                     if current_row:
+                        # Sort baris berdasarkan posisi X
                         rows.append(sorted(current_row, key=lambda x: x['x_center']))
                     current_row = [data]
                     current_y = data['y_center']
@@ -84,90 +106,299 @@ class TableReconstructor:
         
         return rows
     
-    def align_columns(self, rows):
-        """
-        Align data into proper columns
-        """
+    @staticmethod
+    def create_structured_dataframe(rows, max_columns=10):
+        """Buat DataFrame terstruktur dari baris yang sudah dikelompokkan"""
         if not rows:
-            return []
+            return pd.DataFrame()
         
-        # Detect column positions from first row (header)
-        column_positions = []
-        for item in rows[0]:
-            column_positions.append(item['x_center'])
-        
-        # Create structured table
+        # Buat data tabel
         table_data = []
         for row in rows:
-            row_data = [""] * len(column_positions)
-            
-            for item in row:
-                # Find closest column
-                distances = [abs(item['x_center'] - pos) for pos in column_positions]
-                closest_col = distances.index(min(distances))
-                
-                # Assign to column (handle merged cells)
-                if not row_data[closest_col]:
-                    row_data[closest_col] = item['text']
-                else:
-                    # If column already occupied, find next available
-                    for i in range(closest_col + 1, len(column_positions)):
-                        if not row_data[i]:
-                            row_data[i] = item['text']
-                            break
-            
+            row_data = [item['cleaned_text'] for item in row]
+            # Pad row dengan empty string jika kurang dari max_columns
+            while len(row_data) < max_columns:
+                row_data.append('')
             table_data.append(row_data)
         
-        return table_data
-
-    def save_structured_table(self, table_data, output_file):
-        """
-        Save reconstructed table to Excel
-        """
-        # Convert to DataFrame
+        # Buat DataFrame
         df = pd.DataFrame(table_data)
         
-        # Clean empty rows and columns
+        # Hapus baris dan kolom yang seluruhnya kosong
         df = df.replace('', np.nan)
         df = df.dropna(how='all').dropna(axis=1, how='all')
         df = df.fillna('')
         
-        # Save to Excel
-        with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-            df.to_excel(writer, sheet_name='Structured_Table', index=False, header=False)
-            
-            # Auto-adjust column widths
-            worksheet = writer.sheets['Structured_Table']
-            for column in worksheet.columns:
-                max_length = 0
-                column_letter = column[0].column_letter
-                for cell in column:
-                    try:
-                        if len(str(cell.value)) > max_length:
-                            max_length = len(str(cell.value))
-                    except:
-                        pass
-                adjusted_width = min(max_length + 2, 50)
-                worksheet.column_dimensions[column_letter].width = adjusted_width
-        
-        print(f"Structured table saved to: {output_file}")
         return df
 
-# Usage Example
-def main():
-    reconstructor = TableReconstructor()
-    
-    # Process image
-    table_data = reconstructor.detect_table_structure("tes.jpg")
-    
-    if table_data:
-        # Save structured result
-        df = reconstructor.save_structured_table(table_data, "structured_table.xlsx")
-        
-        print("Structured Table Preview:")
-        print(df.head(10))
-    else:
-        print("No data extracted")
+def run_ocr(images, output_dir: Path, processed_dir: Path, lang: str = "en", 
+           excel_engine: str = "openpyxl", use_gpu: bool = False, 
+           enable_reconstruction: bool = True):
+    """
+    Jalankan general OCR dengan opsi structured reconstruction.
+    """
+    print(f"[INFO] Memuat PaddleOCR (lang={lang}, use_gpu={use_gpu}) ...")
+    ocr = PaddleOCR(lang=lang, use_angle_cls=True, use_gpu=use_gpu)
 
+    timestamp = get_timestamp()
+    
+    structured_dfs = {}  # Untuk menyimpan DataFrame terstruktur per gambar
+        
+    print(f"[INFO] Jumlah gambar: {len(images)}")
+    print(f"[INFO] Folder processed: {processed_dir}")
+
+    for i, img_path in enumerate(images, 1):
+        print(f"[{i}/{len(images)}] OCR → {img_path.name}")
+        
+        # AMBIL img_name DARI PATH GAMBAR
+        img_name = img_path.stem
+        
+        # OCR processing
+        result = ocr.ocr(str(img_path), det=True, rec=True, cls=True)
+        ocr_data_for_reconstruction = []
+
+        if result and result[0]:
+            for box, (txt, conf) in result[0]:
+                ocr_data_for_reconstruction.append({
+                    'text': txt,
+                    'confidence': conf,
+                    'bbox': box
+                })
+
+        # Structured Reconstruction
+        if enable_reconstruction and ocr_data_for_reconstruction:
+            try:
+                rows = TableReconstructor.reconstruct_table_from_ocr(ocr_data_for_reconstruction)
+                df_structured = TableReconstructor.create_structured_dataframe(rows)
+                
+                if not df_structured.empty:
+                    structured_dfs[img_name] = df_structured
+                    print(f"  → Berhasil merekonstruksi tabel: {len(df_structured)} baris, {len(df_structured.columns)} kolom")
+                else:
+                    print(f"  → Tidak ada data terstruktur yang dihasilkan")
+            except Exception as e:
+                print(f"  [WARN] Gagal merekonstruksi tabel: {e}")
+
+        # ✅ PINDAHKAN FILE KE FOLDER PROCESSED (SEJAJAR)
+        try:
+            processed_path = processed_dir / img_path.name
+            img_path.rename(processed_path)
+            print(f"  → File dipindahkan ke: {processed_path}")
+        except Exception as e:
+            print(f"  [WARN] Gagal memindahkan file: {e}")
+
+    # Simpan structured results
+    if structured_dfs:
+        for img_name, df_struct in structured_dfs.items():
+            structured_output_path = output_dir / f"{img_name}_structured_{timestamp}.xlsx"
+            
+            with pd.ExcelWriter(structured_output_path, engine=excel_engine, mode="w") as structured_writer:
+                sheet_name = f"{img_name}"[:31]
+                df_struct.to_excel(structured_writer, index=False, header=False, sheet_name=sheet_name)
+                
+                # Auto-adjust column widths
+                worksheet = structured_writer.sheets[sheet_name]
+                for column in worksheet.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    for cell in column:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    adjusted_width = min(max_length + 2, 50)
+                    worksheet.column_dimensions[column_letter].width = adjusted_width
+            
+            print(f"[DONE] Hasil untuk {img_name} disimpan di: {structured_output_path.name}")
+    
+    else:
+        print(f"[INFO] Tidak ada data terstruktur yang dihasilkan")
+
+# ----------------------------- MODE: TABLE OCR -----------------------------
+# def run_table(images, output_dir: Path, lang: str = "en",
+#               image_orientation: bool = True,
+#               table_max_len: int = 1536,
+#               upscale_side: int = 1600):
+#     """
+#     Jalankan Table OCR via PP-Structure.
+#     Output: satu folder per gambar, berisi file Excel per tabel.
+#     """
+#     print(f"[INFO] Memuat PPStructure (lang={lang}, image_orientation={image_orientation}) ...")
+
+#     # Fallback otomatis jika model orientation tidak ditemukan
+#     try:
+#         table_engine = PPStructure(
+#             show_log=True,
+#             lang=lang,
+#             image_orientation=image_orientation,
+#             layout=True,
+#             table=True,
+#             table_max_len=table_max_len
+#         )
+#     except Exception as e:
+#         print(f"[WARN] Gagal memuat image_orientation model, ulang tanpa orientation. Error: {e}")
+#         table_engine = PPStructure(
+#             show_log=True,
+#             lang=lang,
+#             image_orientation=False,
+#             layout=True,
+#             table=True,
+#             table_max_len=table_max_len
+#         )
+
+#     # Folder output dengan timestamp
+#     timestamp = get_timestamp()
+#     base_folder = output_dir / f"table_results_{timestamp}"
+#     base_folder.mkdir(parents=True, exist_ok=True)
+
+#     print(f"[INFO] Jumlah gambar: {len(images)}")
+#     for i, img_path in enumerate(images, 1):
+#         print(f"[{i}/{len(images)}] TABLE → {img_path.name}")
+#         try:
+#             img = _read_and_upscale(img_path, max_side=upscale_side)
+#             result = table_engine(img, return_ocr_result_in_table=True)
+#             save_structure_res(result, str(base_folder), os.path.splitext(img_path.name)[0])
+#         except Exception as e:
+#             print(f"[ERROR] Gagal memproses {img_path.name}: {e}")
+
+#     print(f"[DONE] Hasil Table OCR disimpan di: {base_folder}")
+
+def run_table(images, output_dir: Path, lang: str = "en",
+              image_orientation: bool = True,
+              table_max_len: int = 1536,
+              upscale_side: int = 1600):
+    """
+    Jalankan Table OCR via PP-Structure.
+    Output: satu folder per gambar, berisi file Excel per tabel.
+    """
+    print(f"[INFO] Memuat PPStructure (lang={lang}, image_orientation={image_orientation}) ...")
+
+    # Fallback otomatis jika model orientation tidak ditemukan
+    try:
+        table_engine = PPStructure(
+            show_log=True,
+            lang=lang,
+            image_orientation=image_orientation,
+            layout=True,
+            table=True,
+            table_max_len=table_max_len
+        )
+    except Exception as e:
+        print(f"[WARN] Gagal memuat image_orientation model, ulang tanpa orientation. Error: {e}")
+        table_engine = PPStructure(
+            show_log=True,
+            lang=lang,
+            image_orientation=False,
+            layout=True,
+            table=True,
+            table_max_len=table_max_len
+        )
+
+    # Folder output dengan timestamp
+    timestamp = get_timestamp()
+    base_folder = output_dir / f"table_results_{timestamp}"
+    base_folder.mkdir(parents=True, exist_ok=True)
+
+    print(f"[INFO] Jumlah gambar: {len(images)}")
+    for i, img_path in enumerate(images, 1):
+        print(f"[{i}/{len(images)}] TABLE → {img_path.name}")
+        try:
+            img = _read_and_upscale(img_path, max_side=upscale_side)
+            result = table_engine(img, return_ocr_result_in_table=True)
+            save_structure_res(result, str(base_folder), os.path.splitext(img_path.name)[0])
+            
+            # ✅ OPSIONAL: Juga pindahkan file yang sudah diproses di mode table
+            # processed_path = processed_dir / img_path.name
+            # img_path.rename(processed_path)
+            # print(f"  → File dipindahkan ke: {processed_path}")
+            
+        except Exception as e:
+            print(f"[ERROR] Gagal memproses {img_path.name}: {e}")
+
+    print(f"[DONE] Hasil Table OCR disimpan di: {base_folder}")
+
+# ----------------------------- MAIN ENTRY -----------------------------
+# def main():
+#     ap = argparse.ArgumentParser(description="Ekstraksi teks/tabel dari gambar → Excel (PaddleOCR / PPStructure)")
+#     ap.add_argument("--input", required=True, help="Folder input berisi .png/.jpg/.jpeg")
+#     ap.add_argument("--output", required=True, help="Folder output")
+#     ap.add_argument("--mode", choices=["ocr", "table"], default="table",
+#                     help="ocr = general OCR; table = PP-Structure (ekspor .xlsx per tabel)")
+#     ap.add_argument("--lang", default="en", help="Kode bahasa model (misal: en, ch, fr, german, latin)")
+#     ap.add_argument("--no_image_orientation", action="store_true",
+#                     help="Nonaktifkan deteksi orientasi gambar otomatis (khusus mode=table)")
+#     ap.add_argument("--excel_engine", choices=["openpyxl", "xlsxwriter"], default="openpyxl",
+#                     help="Engine penulisan Excel (default=openpyxl, hanya untuk mode 'ocr')")
+#     ap.add_argument("--use_gpu", action="store_true", help="Gunakan GPU (hanya untuk mode 'ocr')")
+#     ap.add_argument("--no_reconstruction", action="store_true", 
+#                    help="Nonaktifkan structured reconstruction (hanya untuk mode 'ocr')")
+    
+#     args = ap.parse_args()
+
+#     in_dir = Path(args.input)
+#     out_dir = Path(args.output)
+#     out_dir.mkdir(parents=True, exist_ok=True)
+
+#     images = list_images(in_dir)
+#     if not images:
+#         print(f"[ERROR] Tidak ada file gambar yang valid di folder {in_dir}")
+#         sys.exit(1)
+
+#     if args.mode == "ocr":
+#         run_ocr(images, out_dir, 
+#                 lang=args.lang, 
+#                 excel_engine=args.excel_engine, 
+#                 use_gpu=args.use_gpu,
+#                 enable_reconstruction=not args.no_reconstruction)
+#     else:
+#         run_table(images, out_dir, 
+#                  lang=args.lang, 
+#                  image_orientation=(not args.no_image_orientation))
+
+def main():
+    ap = argparse.ArgumentParser(description="Ekstraksi teks/tabel dari gambar → Excel (PaddleOCR / PPStructure)")
+    ap.add_argument("--input", required=True, help="Folder input berisi .png/.jpg/.jpeg")
+    ap.add_argument("--output", required=True, help="Folder output")
+    ap.add_argument("--processed", help="Folder processed (default: sejajar dengan input/output)")
+    ap.add_argument("--mode", choices=["ocr", "table"], default="ocr",  # ✅ PASTIKAN ADA
+                    help="ocr = general OCR; table = PP-Structure (ekspor .xlsx per tabel)")
+    ap.add_argument("--lang", default="en", help="Kode bahasa model (misal: en, ch, fr, german, latin)")
+    ap.add_argument("--no_image_orientation", action="store_true",
+                    help="Nonaktifkan deteksi orientasi gambar otomatis (khusus mode=table)")
+    ap.add_argument("--excel_engine", choices=["openpyxl", "xlsxwriter"], default="openpyxl",
+                    help="Engine penulisan Excel (default=openpyxl, hanya untuk mode 'ocr')")
+    ap.add_argument("--use_gpu", action="store_true", help="Gunakan GPU (hanya untuk mode 'ocr')")
+    ap.add_argument("--no_reconstruction", action="store_true", 
+                   help="Nonaktifkan structured reconstruction (hanya untuk mode 'ocr')")
+    
+    args = ap.parse_args()
+
+    in_dir = Path(args.input)
+    out_dir = Path(args.output)
+    
+    if args.processed:
+        processed_dir = Path(args.processed)
+    else:
+        processed_dir = in_dir.parent / "processed"
+    
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    images = list_images(in_dir)
+    if not images:
+        print(f"[ERROR] Tidak ada file gambar yang valid di folder {in_dir}")
+        sys.exit(1)
+
+    if args.mode == "ocr":
+        run_ocr(images, out_dir, processed_dir,
+                lang=args.lang, 
+                excel_engine=args.excel_engine, 
+                use_gpu=args.use_gpu,
+                enable_reconstruction=not args.no_reconstruction)
+    else:
+        run_table(images, out_dir, 
+                 lang=args.lang, 
+                 image_orientation=(not args.no_image_orientation))
 if __name__ == "__main__":
     main()
