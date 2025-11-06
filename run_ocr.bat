@@ -35,7 +35,6 @@ echo    STARTING OCR PROCESS
 echo ====================================
 
 python main.py --input ./input --output ./output --mode ocr
-@REM python main_structured_and_raw.py --input ./input --output ./output --mode ocr
 
 echo ====================================
 echo    OCR PROCESS COMPLETED
