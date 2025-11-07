@@ -3,15 +3,22 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.so
-.Python
-env/
+
+# Environment
 venv/
+env/
 .venv/
 
-# OCR Output
+# IDE
+.vscode/
+.idea/
+
+# Data & Output
+input/
 output/
 processed/
 
-# Logs
+# Temporary
+temp_*
+*.tmp
 *.log
